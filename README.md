@@ -4,7 +4,7 @@
 
 # LLM Session Resumer
 
-A command-line utility to aggregate and resume chat sessions from **Gemini CLI**, **Claude Code**, and **Codex CLI**. It supports native resumption and cross-tool migration (e.g., resuming a Claude session inside Gemini).
+An OSX command-line utility to aggregate and resume chat sessions from **Gemini CLI**, **Claude Code**, and **Codex CLI**. It supports native resumption and cross-tool migration (e.g., resuming a Claude session inside Gemini).
 
 ## 🚀 Quick Install (Add to PATH)
 
