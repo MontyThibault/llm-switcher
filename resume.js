@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execSync, spawn } = require('child_process');
-const { Select } = require('enquirer');
+const { Confirm, Select } = require('enquirer');
 const { formatDistanceToNow } = require('date-fns');
 
 const HOME = os.homedir();
@@ -12,183 +12,377 @@ const CLAUDE_HISTORY = path.join(HOME, '.claude', 'history.jsonl');
 const CODEX_HISTORY = path.join(HOME, '.codex', 'history.jsonl');
 const GEMINI_DIR = path.join(HOME, '.gemini');
 
-async function getClaudeSessions() {
-    if (!fs.existsSync(CLAUDE_HISTORY)) return [];
-    const content = fs.readFileSync(CLAUDE_HISTORY, 'utf8');
-    const lines = content.trim().split('\n');
-    const sessions = {};
+function warn(message, error) {
+    const details = error && error.message ? `: ${error.message}` : '';
+    console.warn(`Warning: ${message}${details}`);
+}
+
+function readJson(file) {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function readJsonLines(file, label) {
+    if (!fs.existsSync(file)) return [];
+
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    const rows = [];
     for (const line of lines) {
         try {
-            const data = JSON.parse(line);
-            if (!data.sessionId) continue;
-            if (!sessions[data.sessionId]) {
-                sessions[data.sessionId] = {
-                    tool: 'claude',
-                    id: data.sessionId,
-                    description: data.display,
-                    timestamp: data.timestamp,
-                    project: data.project
-                };
-            } else {
-                sessions[data.sessionId].timestamp = Math.max(sessions[data.sessionId].timestamp, data.timestamp);
+            rows.push(JSON.parse(line));
+        } catch (e) {
+            warn(`Skipping malformed ${label} entry`, e);
+        }
+    }
+    return rows;
+}
+
+function listFilesRecursive(dir, predicate = () => true) {
+    if (!fs.existsSync(dir)) return [];
+
+    const files = [];
+    const stack = [dir];
+    while (stack.length > 0) {
+        const current = stack.pop();
+        let entries;
+        try {
+            entries = fs.readdirSync(current, { withFileTypes: true });
+        } catch (e) {
+            warn(`Could not read directory ${current}`, e);
+            continue;
+        }
+
+        for (const entry of entries) {
+            const fullPath = path.join(current, entry.name);
+            if (entry.isDirectory()) {
+                stack.push(fullPath);
+            } else if (entry.isFile() && predicate(fullPath)) {
+                files.push(fullPath);
             }
-        } catch (e) {}
+        }
+    }
+
+    return files;
+}
+
+function normalizeText(value, fallback = '(No description)') {
+    if (typeof value !== 'string') return fallback;
+    const text = value.replace(/\s+/g, ' ').trim();
+    return text || fallback;
+}
+
+function firstLine(value) {
+    if (typeof value !== 'string') return '(No description)';
+    return normalizeText(value.split('\n')[0].substring(0, 80));
+}
+
+function normalizeTimestamp(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string') {
+        const parsed = new Date(value).getTime();
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return 0;
+}
+
+function appendSession(sessions, session) {
+    if (!session.id) return;
+    const current = sessions[session.id];
+    const next = {
+        ...session,
+        description: firstLine(session.description),
+        timestamp: normalizeTimestamp(session.timestamp)
+    };
+
+    if (!current) {
+        sessions[session.id] = next;
+        return;
+    }
+
+    if (next.project && !current.project) current.project = next.project;
+    if (current.description === '(No description)' && next.description !== '(No description)') {
+        current.description = next.description;
+    }
+
+    if (next.timestamp >= current.timestamp) {
+        sessions[session.id] = {
+            ...current,
+            ...next,
+            description: next.description !== '(No description)' ? next.description : current.description,
+            project: next.project || current.project
+        };
+    }
+}
+
+function extractContent(content, allowedTypes) {
+    if (typeof content === 'string') return normalizeText(content, '');
+    if (!Array.isArray(content)) return '';
+
+    return content
+        .map((part) => {
+            if (!part || typeof part !== 'object') return '';
+            if (allowedTypes && part.type && !allowedTypes.includes(part.type)) return '';
+            return typeof part.text === 'string' ? part.text : '';
+        })
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+}
+
+function isUsefulUserText(text) {
+    return text && !text.startsWith('<environment_context>');
+}
+
+function extractCodexResponseMessage(data) {
+    const payload = data && data.payload;
+    if (!payload || payload.type !== 'message') return null;
+    if (!['user', 'assistant'].includes(payload.role)) return null;
+
+    const text = extractContent(
+        payload.content,
+        payload.role === 'user' ? ['input_text'] : ['output_text']
+    );
+    if (payload.role === 'user' && !isUsefulUserText(text)) return null;
+    if (!text) return null;
+
+    return `[${payload.role.toUpperCase()}]: ${text}`;
+}
+
+function extractCodexLegacyMessage(data) {
+    const payload = data && data.payload;
+    if (!payload || !payload.message) return null;
+    if (!['user_message', 'agent_message'].includes(payload.type)) return null;
+
+    const text = normalizeText(payload.message, '');
+    if (payload.type === 'user_message' && !isUsefulUserText(text)) return null;
+    if (!text) return null;
+
+    const role = payload.type === 'user_message' ? 'USER' : 'ASSISTANT';
+    return `[${role}]: ${text}`;
+}
+
+function extractClaudeMessage(data) {
+    if (!data || !data.message) return null;
+
+    if (data.type === 'user') {
+        const text = extractContent(data.message.content, ['text']);
+        if (!text) return null;
+        return `[USER]: ${text}`;
+    }
+
+    if (data.type === 'assistant') {
+        const text = extractContent(data.message.content, ['text']);
+        if (!text) return null;
+        return `[ASSISTANT]: ${text}`;
+    }
+
+    return null;
+}
+
+function extractGeminiMessage(message) {
+    if (!message || !['user', 'gemini', 'assistant', 'model'].includes(message.type)) return null;
+
+    const text = extractContent(message.content, ['text']);
+    if (!text) return null;
+
+    const role = message.type === 'user' ? 'USER' : 'ASSISTANT';
+    return `[${role}]: ${text}`;
+}
+
+async function getClaudeSessions() {
+    if (!fs.existsSync(CLAUDE_HISTORY)) return [];
+    const sessions = {};
+    for (const data of readJsonLines(CLAUDE_HISTORY, 'Claude history')) {
+        if (!data.sessionId) continue;
+        appendSession(sessions, {
+            tool: 'claude',
+            id: data.sessionId,
+            description: data.display,
+            timestamp: data.timestamp,
+            project: data.project
+        });
     }
     return Object.values(sessions);
 }
 
 async function getCodexSessions() {
-    if (!fs.existsSync(CODEX_HISTORY)) return [];
-    const content = fs.readFileSync(CODEX_HISTORY, 'utf8');
-    const lines = content.trim().split('\n');
     const sessions = {};
-    for (const line of lines) {
-        try {
-            const data = JSON.parse(line);
-            if (!data.session_id) continue;
-            if (!sessions[data.session_id]) {
-                sessions[data.session_id] = {
-                    tool: 'codex',
-                    id: data.session_id,
-                    description: data.text.split('\n')[0].substring(0, 80),
-                    timestamp: data.ts * 1000,
-                    project: null
-                };
-            } else {
-                sessions[data.session_id].timestamp = Math.max(sessions[data.session_id].timestamp, data.ts * 1000);
-            }
-        } catch (e) {}
+    for (const data of readJsonLines(CODEX_HISTORY, 'Codex history')) {
+        if (!data.session_id) continue;
+        appendSession(sessions, {
+            tool: 'codex',
+            id: data.session_id,
+            description: data.text,
+            timestamp: typeof data.ts === 'number' ? data.ts * 1000 : data.ts,
+            project: null
+        });
     }
 
     const sessionsDir = path.join(HOME, '.codex', 'sessions');
-    if (fs.existsSync(sessionsDir)) {
-        try {
-            const rolloutFiles = execSync(`find "${sessionsDir}" -name "rollout-*.jsonl"`).toString().split('\n');
-            for (const file of rolloutFiles) {
-                if (!file) continue;
-                try {
-                    const firstLine = execSync(`head -n 1 "${file}"`).toString();
-                    const data = JSON.parse(firstLine);
-                    if (data.type === 'session_meta' && data.payload && sessions[data.payload.id]) {
-                        sessions[data.payload.id].project = data.payload.cwd;
-                    }
-                } catch (e) {}
-            }
-        } catch (e) {}
+    const rolloutFiles = listFilesRecursive(sessionsDir, file => path.basename(file).startsWith('rollout-') && file.endsWith('.jsonl'));
+    for (const file of rolloutFiles) {
+        const rows = readJsonLines(file, 'Codex rollout');
+        const meta = rows.find(row => row.type === 'session_meta' && row.payload && row.payload.id);
+        if (!meta) continue;
+
+        const firstUserMessage = rows
+            .map(extractCodexResponseMessage)
+            .find(message => message && message.startsWith('[USER]: '));
+
+        appendSession(sessions, {
+            tool: 'codex',
+            id: meta.payload.id,
+            description: firstUserMessage ? firstUserMessage.replace('[USER]: ', '') : undefined,
+            timestamp: meta.payload.timestamp || meta.timestamp,
+            project: meta.payload.cwd
+        });
     }
 
-    return Object.values(sessions).map(s => {
-        if (!s.project) s.project = process.cwd();
-        return s;
-    });
+    return Object.values(sessions);
+}
+
+function getGeminiProjects() {
+    const projectsPath = path.join(GEMINI_DIR, 'projects.json');
+    const projects = {};
+
+    if (fs.existsSync(projectsPath)) {
+        try {
+            Object.assign(projects, readJson(projectsPath).projects || {});
+        } catch (e) {
+            warn('Could not read Gemini projects.json', e);
+        }
+    }
+
+    const tmpDir = path.join(GEMINI_DIR, 'tmp');
+    if (fs.existsSync(tmpDir)) {
+        try {
+            for (const entry of fs.readdirSync(tmpDir, { withFileTypes: true })) {
+                if (!entry.isDirectory()) continue;
+                const projectRootFile = path.join(tmpDir, entry.name, '.project_root');
+                if (!fs.existsSync(projectRootFile)) continue;
+                const projectPath = fs.readFileSync(projectRootFile, 'utf8').trim();
+                if (projectPath) projects[projectPath] = entry.name;
+            }
+        } catch (e) {
+            warn('Could not inspect Gemini tmp projects', e);
+        }
+    }
+
+    return projects;
 }
 
 async function getGeminiSessions() {
     const sessions = [];
-    const projectsPath = path.join(GEMINI_DIR, 'projects.json');
-    if (!fs.existsSync(projectsPath)) return [];
-    
-    try {
-        const projectsData = JSON.parse(fs.readFileSync(projectsPath, 'utf8'));
-        for (const [projectPath, projectId] of Object.entries(projectsData.projects)) {
-            const logsPath = path.join(GEMINI_DIR, 'tmp', projectId, 'logs.json');
-            if (fs.existsSync(logsPath)) {
-                try {
-                    const logs = JSON.parse(fs.readFileSync(logsPath, 'utf8'));
-                    const projectSessions = {};
-                    for (const log of logs) {
-                        if (!log.sessionId) continue;
-                        if (!projectSessions[log.sessionId]) {
-                            projectSessions[log.sessionId] = {
-                                tool: 'gemini',
-                                id: log.sessionId,
-                                description: log.message.split('\n')[0].substring(0, 80),
-                                timestamp: new Date(log.timestamp).getTime(),
-                                project: projectPath
-                            };
-                        } else {
-                            projectSessions[log.sessionId].timestamp = Math.max(
-                                projectSessions[log.sessionId].timestamp, 
-                                new Date(log.timestamp).getTime()
-                            );
-                        }
-                    }
-                    sessions.push(...Object.values(projectSessions));
-                } catch (e) {}
+    const projectsData = getGeminiProjects();
+
+    for (const [projectPath, projectId] of Object.entries(projectsData)) {
+        const logsPath = path.join(GEMINI_DIR, 'tmp', projectId, 'logs.json');
+        if (!fs.existsSync(logsPath)) continue;
+
+        try {
+            const logs = readJson(logsPath);
+            const projectSessions = {};
+            for (const log of Array.isArray(logs) ? logs : []) {
+                if (!log.sessionId) continue;
+                appendSession(projectSessions, {
+                    tool: 'gemini',
+                    id: log.sessionId,
+                    description: log.message,
+                    timestamp: log.timestamp,
+                    project: projectPath
+                });
             }
+            sessions.push(...Object.values(projectSessions));
+        } catch (e) {
+            warn(`Could not read Gemini logs for ${projectPath}`, e);
         }
-    } catch (e) {}
+    }
     return sessions;
 }
 
 async function getTranscript(s) {
     if (s.tool === 'gemini') {
         try {
-            const projectsData = JSON.parse(fs.readFileSync(path.join(GEMINI_DIR, 'projects.json'), 'utf8'));
-            const projectId = projectsData.projects[s.project];
-            const chatDir = path.join(GEMINI_DIR, 'tmp', projectId, 'chats');
-            const files = fs.readdirSync(chatDir);
-            const sessionFile = files.find(f => f.includes(s.id.substring(0, 8)));
-            if (sessionFile) {
-                const data = JSON.parse(fs.readFileSync(path.join(chatDir, sessionFile), 'utf8'));
-                return data.messages.map(m => {
-                    const content = Array.isArray(m.content) ? m.content.map(c => c.text).join('') : (m.content || '');
-                    return `[${m.type.toUpperCase()}]: ${content}`;
-                }).join('\n\n');
+            const projectsData = getGeminiProjects();
+            const projectId = projectsData[s.project];
+            if (!projectId) {
+                warn(`Could not map Gemini project ${s.project}`);
+                return null;
             }
-        } catch (e) {}
+            const chatDir = path.join(GEMINI_DIR, 'tmp', projectId, 'chats');
+            const files = listFilesRecursive(chatDir, file => file.endsWith('.json'));
+            for (const file of files) {
+                const data = readJson(file);
+                if (data.sessionId !== s.id) continue;
+
+                return (Array.isArray(data.messages) ? data.messages : [])
+                    .map(extractGeminiMessage)
+                    .filter(Boolean)
+                    .join('\n\n');
+            }
+            warn(`Could not find Gemini transcript for ${s.id}`);
+        } catch (e) {
+            warn(`Could not read Gemini transcript for ${s.id}`, e);
+        }
     } else if (s.tool === 'codex') {
         try {
             const sessionsDir = path.join(HOME, '.codex', 'sessions');
-            const rolloutFiles = execSync(`find "${sessionsDir}" -name "rollout-*${s.id}*.jsonl"`).toString().split('\n');
-            if (rolloutFiles[0]) {
-                const content = fs.readFileSync(rolloutFiles[0], 'utf8');
-                return content.split('\n').filter(l => l).map(l => {
-                    const data = JSON.parse(l);
-                    if (data.type === 'event_msg' && data.payload.message) {
-                        const role = data.payload.type === 'user_message' ? 'USER' : 'ASSISTANT';
-                        return `[${role}]: ${data.payload.message}`;
-                    }
-                    return null;
-                }).filter(m => m).join('\n\n');
+            const rolloutFiles = listFilesRecursive(sessionsDir, file => path.basename(file).includes(s.id) && file.endsWith('.jsonl'));
+            if (!rolloutFiles[0]) {
+                warn(`Could not find Codex transcript for ${s.id}`);
+                return null;
             }
-        } catch (e) {}
+
+            const rows = readJsonLines(rolloutFiles[0], 'Codex transcript');
+            const responseMessages = rows.map(extractCodexResponseMessage).filter(Boolean);
+            if (responseMessages.length > 0) return responseMessages.join('\n\n');
+
+            return rows.map(extractCodexLegacyMessage).filter(Boolean).join('\n\n');
+        } catch (e) {
+            warn(`Could not read Codex transcript for ${s.id}`, e);
+        }
     } else if (s.tool === 'claude') {
         try {
             const projectsDir = path.join(HOME, '.claude', 'projects');
-            const sessionFiles = execSync(`find "${projectsDir}" -name "${s.id}.jsonl"`).toString().split('\n');
+            const sessionFiles = listFilesRecursive(projectsDir, file => path.basename(file) === `${s.id}.jsonl`);
             if (sessionFiles[0]) {
-                const content = fs.readFileSync(sessionFiles[0], 'utf8');
-                return content.split('\n').filter(l => l).map(l => {
-                    const data = JSON.parse(l);
-                    if (data.type === 'user') {
-                        const content = Array.isArray(data.message.content) ? data.message.content.map(c => c.text).join('') : data.message.content;
-                        return `[USER]: ${content}`;
-                    } else if (data.type === 'assistant') {
-                        const content = Array.isArray(data.message.content) ? data.message.content.map(c => c.text || c.thinking || '').join('') : data.message.content;
-                        return `[ASSISTANT]: ${content}`;
-                    }
-                    return null;
-                }).filter(m => m).join('\n\n');
+                return readJsonLines(sessionFiles[0], 'Claude transcript')
+                    .map(extractClaudeMessage)
+                    .filter(Boolean)
+                    .join('\n\n');
             }
-        } catch (e) {}
-        
+        } catch (e) {
+            warn(`Could not read Claude transcript for ${s.id}`, e);
+        }
+
         // Final fallback to user prompts from history.jsonl
-        const content = fs.readFileSync(CLAUDE_HISTORY, 'utf8');
-        return content.split('\n').filter(l => l).map(l => {
-            const data = JSON.parse(l);
-            if (data.sessionId === s.id) {
-                return `[USER]: ${data.display}`;
-            }
-            return null;
-        }).filter(m => m).join('\n\n');
+        return readJsonLines(CLAUDE_HISTORY, 'Claude history fallback')
+            .map(data => data.sessionId === s.id ? `[USER]: ${normalizeText(data.display, '')}` : null)
+            .filter(Boolean)
+            .join('\n\n');
     }
     return null;
 }
 
+async function resolveCwd(project) {
+    if (!project) return process.cwd();
+    if (fs.existsSync(project) && fs.statSync(project).isDirectory()) return project;
+
+    warn(`Saved project directory does not exist: ${project}`);
+    const useCurrent = await new Confirm({
+        name: 'useCurrent',
+        message: `Use current directory instead (${process.cwd()})?`,
+        initial: false
+    }).run();
+
+    if (!useCurrent) process.exit(1);
+    return process.cwd();
+}
+
 async function resumeSession(s, targetTool) {
+    const cwd = await resolveCwd(s.project);
+
     if (s.tool === targetTool) {
-        console.log(`\nResuming ${s.tool.toUpperCase()} session in ${s.project || process.cwd()}...`);
+        console.log(`\nResuming ${s.tool.toUpperCase()} session in ${cwd}...`);
         let cmd, args;
         if (s.tool === 'claude') {
             cmd = 'claude';
@@ -196,10 +390,10 @@ async function resumeSession(s, targetTool) {
         } else if (s.tool === 'codex') {
             cmd = 'codex';
             args = ['resume', s.id];
-            if (s.project) args.push('-C', s.project);
+            args.push('-C', cwd);
         } else if (s.tool === 'gemini') {
             try {
-                const list = execSync(`gemini --list-sessions`, { cwd: s.project || process.cwd() }).toString();
+                const list = execSync(`gemini --list-sessions`, { cwd }).toString();
                 const lines = list.split('\n');
                 let index = null;
                 for (const line of lines) {
@@ -220,12 +414,16 @@ async function resumeSession(s, targetTool) {
                 process.exit(1);
             }
         }
-        spawn(cmd, args, { cwd: s.project || process.cwd(), stdio: 'inherit' }).on('exit', (code) => process.exit(code || 0));
+        spawn(cmd, args, { cwd, stdio: 'inherit' }).on('exit', (code) => process.exit(code || 0));
     } else {
         console.log(`\nMigrating session from ${s.tool.toUpperCase()} to ${targetTool.toUpperCase()}...`);
         const transcript = await getTranscript(s);
+        if (!transcript || !transcript.trim()) {
+            console.error(`Could not extract a transcript for ${s.tool.toUpperCase()} session ${s.id}. Migration aborted.`);
+            process.exit(1);
+        }
         const initialPrompt = `Continuing session from ${s.tool.toUpperCase()}.\n\nTranscript:\n${transcript}\n\nPlease resume from where we left off.`;
-        
+
         let cmd, args;
         if (targetTool === 'claude') {
             cmd = 'claude';
@@ -237,8 +435,8 @@ async function resumeSession(s, targetTool) {
             cmd = 'gemini';
             args = [initialPrompt];
         }
-        
-        spawn(cmd, args, { cwd: s.project || process.cwd(), stdio: 'inherit' }).on('exit', (code) => process.exit(code || 0));
+
+        spawn(cmd, args, { cwd, stdio: 'inherit' }).on('exit', (code) => process.exit(code || 0));
     }
 }
 
@@ -251,8 +449,7 @@ async function main() {
 
     let allSessions = [...claude, ...codex, ...gemini];
     allSessions.sort((a, b) => b.timestamp - a.timestamp);
-    allSessions = allSessions.slice(0, 15);
-    allSessions.reverse();
+    allSessions = allSessions.slice(0, 30);
 
     if (allSessions.length === 0) {
         console.log('No sessions found.');
@@ -272,7 +469,6 @@ async function main() {
         name: 'session',
         message: 'Select a session to resume',
         choices: sessionChoices,
-        initial: sessionChoices.length - 1
     });
 
     try {
