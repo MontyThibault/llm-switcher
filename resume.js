@@ -12,6 +12,12 @@ const CLAUDE_HISTORY = path.join(HOME, '.claude', 'history.jsonl');
 const CODEX_HISTORY = path.join(HOME, '.codex', 'history.jsonl');
 const GEMINI_DIR = path.join(HOME, '.gemini');
 
+const TOOL_COMMANDS = {
+    claude: 'claude',
+    codex: 'codex',
+    gemini: 'gemini'
+};
+
 function warn(message, error) {
     const details = error && error.message ? `: ${error.message}` : '';
     console.warn(`Warning: ${message}${details}`);
@@ -73,6 +79,61 @@ function normalizeText(value, fallback = '(No description)') {
 function firstLine(value) {
     if (typeof value !== 'string') return '(No description)';
     return normalizeText(value.split('\n')[0].substring(0, 80));
+}
+
+function formatProject(project) {
+    if (!project) return path.basename(process.cwd());
+
+    const base = path.basename(project);
+    const parent = path.basename(path.dirname(project));
+    if (!parent || parent === path.sep) return base;
+    return `${parent}/${base}`;
+}
+
+function commandExists(command) {
+    if (!command) return false;
+
+    if (command.includes(path.sep)) {
+        try {
+            fs.accessSync(command, fs.constants.X_OK);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    const pathEntries = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+    const extensions = process.platform === 'win32'
+        ? (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';')
+        : [''];
+
+    for (const dir of pathEntries) {
+        for (const ext of extensions) {
+            const candidate = path.join(dir, `${command}${ext}`);
+            try {
+                fs.accessSync(candidate, fs.constants.X_OK);
+                return true;
+            } catch (e) {}
+        }
+    }
+
+    return false;
+}
+
+function ensureToolInstalled(tool) {
+    const command = TOOL_COMMANDS[tool];
+    if (commandExists(command)) return command;
+
+    console.error(`Cannot launch ${tool.toUpperCase()}: '${command}' was not found on PATH.`);
+    console.error(`Install ${tool.toUpperCase()} CLI or update PATH, then run this again.`);
+    process.exit(1);
+}
+
+function migrationPromptTitle(session) {
+    const description = firstLine(session.description);
+    const source = session.tool.toUpperCase();
+    if (description === '(No description)') return `${source} import`;
+    return `${source}: ${description}`;
 }
 
 function normalizeTimestamp(value) {
@@ -380,20 +441,21 @@ async function resolveCwd(project) {
 
 async function resumeSession(s, targetTool) {
     const cwd = await resolveCwd(s.project);
+    const targetCommand = ensureToolInstalled(targetTool);
 
     if (s.tool === targetTool) {
         console.log(`\nResuming ${s.tool.toUpperCase()} session in ${cwd}...`);
         let cmd, args;
         if (s.tool === 'claude') {
-            cmd = 'claude';
+            cmd = targetCommand;
             args = ['--resume', s.id];
         } else if (s.tool === 'codex') {
-            cmd = 'codex';
+            cmd = targetCommand;
             args = ['resume', s.id];
             args.push('-C', cwd);
         } else if (s.tool === 'gemini') {
             try {
-                const list = execSync(`gemini --list-sessions`, { cwd }).toString();
+                const list = execSync(`${targetCommand} --list-sessions`, { cwd }).toString();
                 const lines = list.split('\n');
                 let index = null;
                 for (const line of lines) {
@@ -403,7 +465,7 @@ async function resumeSession(s, targetTool) {
                     }
                 }
                 if (index) {
-                    cmd = 'gemini';
+                    cmd = targetCommand;
                     args = ['--resume', index];
                 } else {
                     console.error('Could not find session index for Gemini session.');
@@ -422,17 +484,17 @@ async function resumeSession(s, targetTool) {
             console.error(`Could not extract a transcript for ${s.tool.toUpperCase()} session ${s.id}. Migration aborted.`);
             process.exit(1);
         }
-        const initialPrompt = `Continuing session from ${s.tool.toUpperCase()}.\n\nTranscript:\n${transcript}\n\nPlease resume from where we left off.`;
+        const initialPrompt = `${migrationPromptTitle(s)}\n\nTranscript:\n${transcript}\n\nPlease resume from where we left off.`;
 
         let cmd, args;
         if (targetTool === 'claude') {
-            cmd = 'claude';
+            cmd = targetCommand;
             args = [initialPrompt];
         } else if (targetTool === 'codex') {
-            cmd = 'codex';
+            cmd = targetCommand;
             args = [initialPrompt];
         } else if (targetTool === 'gemini') {
-            cmd = 'gemini';
+            cmd = targetCommand;
             args = [initialPrompt];
         }
 
@@ -462,7 +524,8 @@ async function main() {
         const time = formatDistanceToNow(s.timestamp, { addSuffix: true });
         const tool = `${toolColor}[${s.tool.toUpperCase()}]${reset}`;
         const desc = (s.description.trim() || '(No description)').replace(/\n/g, ' ');
-        return { name: i.toString(), message: `${tool} ${desc}`, hint: `(${time})` };
+        const project = formatProject(s.project);
+        return { name: i.toString(), message: `${tool} ${desc}`, hint: `(${time} | ${project})` };
     });
 
     const sessionPrompt = new Select({
